@@ -7,5 +7,12 @@ except ImportError:
     renderdoc_present = False
     pass
 
-if renderdoc_present:
-    from .renderdoc import *
+# try:
+#     pyrenderdoc
+#     renderdoc_ui_present = True
+# except NameError:
+#     renderdoc_ui_present = False
+
+if renderdoc_present: # and renderdoc_ui_present:
+    # TODO don't try to import renderdoc.ui if we're running in a shell script? 'pyrenderdoc' in globals() doesn't work as a test for this though...
+    from .renderdoc.ui import *
