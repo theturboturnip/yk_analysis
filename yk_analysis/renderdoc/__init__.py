@@ -1,6 +1,6 @@
 import functools
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Set, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 import renderdoc as rd
 import qrenderdoc as qrd
 import PySide2.QtWidgets as widgets
@@ -131,6 +131,7 @@ def perform_analysis(ctx: qrd.CaptureContext, r: rd.ReplayController, mqt: qrd.M
 def perform_analysis_inner(ctx: qrd.CaptureContext, r: rd.ReplayController, mqt: qrd.MiniQtHelper, db_path: str, debug: bool = False):
     if debug:
         cnt = 0
+        # TODO don't use hardcoded path
         dbg_file = open("C:\\Users\\Samuel\\ext_dbg_temp.txt", "a")
         def print_d(*args):
             nonlocal cnt
@@ -144,28 +145,14 @@ def perform_analysis_inner(ctx: qrd.CaptureContext, r: rd.ReplayController, mqt:
 
     print_d("opening db")
     db = ReadOnlyDb(db_path, expected_version=1)
-    print_d("opened db")
-
-    def lookup_shader_bytes_in_db(shader_stage: str, bytes_type: str, b: bytes) -> Optional[str]:
-        h = sha256()
-        h.update(b)
-        d = h.digest()
-        print_d("digest", d)
-        
-        db.cur.execute("SELECT Category, ShaderName FROM ShaderBytes WHERE ShaderStage = ? AND BytesType = ? AND SHA256 = ?", (shader_stage, bytes_type, d, ))
-        data = set(
-            (str(cat), str(s_name))
-            for cat, s_name in db.cur.fetchall()
-        )
-        print_d("recalled shaders", data)
-        if len(data) == 1:
-            cat, s_name = next(iter(data))
-            return s_name
-        return None
+    print_d("opened db")      
     
-    shader_names: Dict[rd.ResourceId, Optional[str]] = {}
+    shader_names: Dict[rd.ResourceId, Optional[Set[Tuple[str, str]]]] = {}
 
-    def lookup_shader_in_db(s: rd.D3D11Shader) -> Optional[str]:
+    # Given a RenderDoc shader object, translates its data into DB-compatible formats and looks it up in the DB.
+    # If this shader has been lookedup before, returns the contents of shader_names[s.resourceId].
+    # Otherwise sets shader_names[s.resourceId] with the possible names retrieved from the DB.
+    def lookup_shader_in_db(s: rd.D3D11Shader) -> Optional[Set[Tuple[str, str]]]:
         if s.resourceId in shader_names:
             return shader_names[s.resourceId]
         shader_names[s.resourceId] = None
@@ -185,59 +172,109 @@ def perform_analysis_inner(ctx: qrd.CaptureContext, r: rd.ReplayController, mqt:
         else:
             return None
         
-        name = lookup_shader_bytes_in_db(shader_stage, bytes_type, s.reflection.rawBytes)
-        if name is None:
-            return None
-        # print_d(name)
-        shader_names[s.resourceId] = name
-
-        print_d(f"@{s.resourceId} {shader_stage} {bytes_type} {s.reflection.rawBytes[:16]} {name}")
+        h = sha256()
+        h.update(s.reflection.rawBytes)
+        d = h.digest()
+        print_d("digest", d)
         
-        # Don't call this from the replay thread - things break
-        # ctx.SetResourceCustomName(s.resourceId, f"{name} ({shader_stage})")
-        return name
+        db.cur.execute("SELECT Category, ShaderName FROM ShaderBytes WHERE ShaderStage = ? AND BytesType = ? AND SHA256 = ?", (shader_stage, bytes_type, d, ))
+        possible_names: Optional[Set[Tuple[str, str]]] = set(
+            (str(cat), str(s_name))
+            for cat, s_name in db.cur.fetchall()
+        )
+        if not possible_names:
+            possible_names = None
+        print_d(f"shaderId@", s.resourceId, shader_stage, bytes_type, possible_names)
+        shader_names[s.resourceId] = possible_names
+        return possible_names
+    
+    # Given a pair of shaders, looks up both of them in the DB, sees if they have a common name and if so sets both their entries in shader_names to just that name.
+    def lookup_shader_pair(vert: rd.D3D11Shader, pix: rd.D3D11Shader) -> Tuple[Optional[Set[Tuple[str, str]]], Optional[Set[Tuple[str, str]]]]:
+        vert_names = lookup_shader_in_db(vert)
+        pix_names = lookup_shader_in_db(pix)
 
+        if vert_names is None or pix_names is None:
+            return vert_names, pix_names
+
+        common_names = vert_names.intersection(pix_names)
+        if common_names:
+            print_d("intersected vertId@", vert.resourceId, "pixId@", pix.resourceId, "new names", common_names)
+            # These are references to the objects inside shader_names
+            vert_names.intersection_update(common_names)
+            # shader_names[pix.resourceId] = vert_names # Don't do intersection_update, make them literally the same object so further refinements apply to both
+            pix_names.intersection_update(common_names)
+        return vert_names, pix_names
+
+    def condensed_manyname(names: Optional[Set[Tuple[str, str]]]) -> str:
+        if not names:
+            return "??"
+        elif len(names) == 1:
+            cat, shader = next(iter(names))
+            return shader
+        else:
+            return "(" + " | ".join(shader for _cat, shader in names) + ")"
+
+    action_names: Dict[int, str] = {}
+
+    # First pass: find correct shader_names
     # Start iterating from the first real action as a child of markers
     action = cast(rd.ActionDescription, r.GetRootActions()[0])
     while len(action.children) > 0:
         action = action.children[0]
 
-    print_d(action)
-
     while action is not None:
-        print_d(f"{action}, {action.flags}")
-
         if action.flags & rd.ActionFlags.Drawcall:
             r.SetFrameEvent(action.eventId, False) # force=False
-            print_d("set frame event")
             d3d11state = r.GetD3D11PipelineState()
-            print_d(d3d11state.vertexShader)
-            vertex_name = lookup_shader_in_db(d3d11state.vertexShader)
-            fragment_name = lookup_shader_in_db(d3d11state.pixelShader)
-            print_d("names", vertex_name, fragment_name)
-            if vertex_name is None and fragment_name is None:
-                # Don't set a custom name
-                custom_name = None
-            elif vertex_name == fragment_name:
-                custom_name = f"{vertex_name}"
-            else:
-                custom_name = f"{vertex_name} - {fragment_name}"
+            vertex_name, pixel_name = lookup_shader_pair(d3d11state.vertexShader, d3d11state.pixelShader)
 
-            if custom_name is not None:
-                print_d(f"Setting custom name '{custom_name}'")
-                # TODO maybe don't do this from here - the UI thread doesn't uncache them
-                action.customName = custom_name
+            print_d("action@", action.eventId, "vertId@",  d3d11state.vertexShader.resourceId, vertex_name, "pixId@", d3d11state.pixelShader.resourceId,  pixel_name)
+
+        action = action.next
+
+    # Second pass: find new action names
+    # Start iterating from the first real action as a child of markers
+    action = cast(rd.ActionDescription, r.GetRootActions()[0])
+    while len(action.children) > 0:
+        action = action.children[0]
+
+    while action is not None:
+        if action.flags & rd.ActionFlags.Drawcall:
+            r.SetFrameEvent(action.eventId, False) # force=False
+            d3d11state = r.GetD3D11PipelineState()
+            
+            vertex_name = shader_names.get(d3d11state.vertexShader.resourceId)
+            pixel_name = shader_names.get(d3d11state.pixelShader.resourceId)
+            if vertex_name is None and pixel_name is None:
+                action_name = None
+            elif vertex_name == pixel_name:
+                action_name = f"{condensed_manyname(vertex_name)}"
+            else:
+                action_name = f"{condensed_manyname(vertex_name)} - {condensed_manyname(pixel_name)}"
+            
+            if action_name:
+                # action.GetName returns some extra cruft e.g. "ID3D11DeviceContext::DrawIndexed()" instead of DrawIndexed
+                if action.indexOffset:
+                    old_name = f"DrawIndexed({action.numIndices})"
+                else:
+                    old_name = f"Draw({action.numIndices})"
+                # old_name = action.GetName(r.GetStructuredFile())
+                action_names[action.eventId] = f"{old_name} - {action_name}"
 
         action = action.next
 
     if debug:
         dbg_file.close()
 
+    # Final pass - in the UI thread, actually update the names
     def finish():
-        for resourceId, name in shader_names.items():
-            if not name:
+        for resourceId, possible_names in shader_names.items():
+            if not possible_names:
                 continue
-            ctx.SetResourceCustomName(resourceId, f"{name}")
+            ctx.SetResourceCustomName(resourceId, condensed_manyname(possible_names))
+        for eventId, action_name in action_names.items():
+            # ctx.SetFrameEvent(eventId) # Update the name in the UI
+            ctx.GetAction(eventId).customName = action_name
         ctx.Extensions().MessageDialog(f"Done!", "Extension message")
 
     mqt.InvokeOntoUIThread(finish)
