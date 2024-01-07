@@ -3,8 +3,8 @@ import sqlite3
 import argparse
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Set, Tuple
-from analysis_helpers.db import ReadOnlyDb
-from analysis_helpers.data import ShaderAggregate
+from yk_analysis.analysis_helpers.db import ReadOnlyDb
+from yk_analysis.analysis_helpers.data import ShaderAggregate
 
 EXPECTED_DRAWCALL_DB_VERSION = 1
 

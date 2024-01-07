@@ -1,7 +1,7 @@
 import argparse
 from typing import cast
-from analysis_helpers.data import ShaderAggregate
-from analysis_helpers.vertex import GMDVertexBufferLayout
+from yk_analysis.analysis_helpers.data import ShaderAggregate
+from yk_analysis.analysis_helpers.vertex import GMDVertexBufferLayout
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
